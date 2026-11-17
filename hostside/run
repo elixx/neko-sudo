@@ -1,0 +1,7 @@
+#!/bin/sh
+# neko-sudo host wrapper shim. Installed at /usr/local/lib/neko-sudo/run,
+# root-owned 0755 — the ONLY command sudoers grants the agent account.
+# Exact argv passthrough: whatever the agent typed is what gets gated.
+set -eu
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PYTHONPATH="$DIR" exec python3 -m hostside.cli "$@"

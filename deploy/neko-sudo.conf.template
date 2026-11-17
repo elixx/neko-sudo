@@ -1,0 +1,11 @@
+# neko-sudo host wrapper config — root-owned, mode 0600.
+# host MUST match the line you added to the gate's tokens.conf;
+# token is the raw secret minted alongside that line.
+
+[gate]
+url = https://sudo.example.com
+token = REPLACE_WITH_HOST_TOKEN
+host  = @HOST@
+user  = @USER@
+# The approval window is owned by the gate (env NEKO_SUDO_APPROVAL_TTL_S
+# there, default 300s); hosts carry no TTL of their own.

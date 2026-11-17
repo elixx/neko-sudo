@@ -1,0 +1,77 @@
+# CI for neko-sudo: tests gate every MR and main push; pushes to main
+# (commits and completed MRs land as pushes) build + push the multi-arch
+# gate image to this project's container registry, reusing
+# deploy/build-multiarch.sh so CI and a manual build cannot drift.
+#
+# Runner requirement: a docker executor with privileged = true
+# (docker-in-docker; arm64 via QEMU binfmt inside dind).
+# After CI is green, deploy the new image from a Swarm manager:
+#   docker service update --force --image <registry-path>/gate:latest neko-sudo_gate
+
+workflow:
+  rules:
+    # MR pipelines: tests only (build job excludes itself below).
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # Pushes to main, including the push a completed merge makes.
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
+
+stages: [test, build]
+
+variables:
+  # GitLab's predefined registry path for this project; the build script
+  # pushes $NEKO_SUDO_IMAGE:latest.
+  NEKO_SUDO_IMAGE: "$CI_REGISTRY_IMAGE/gate"
+  # Plain-TCP dind (hostname "docker", port 2375) — DOCKER_TLS_CERTDIR
+  # empty keeps dind off TLS/2376, which would need cert volumes shared
+  # through the runner config. Project/group CI/CD variables override
+  # these, so remove any DOCKER_HOST variable defined in the GitLab UI.
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_DRIVER: overlay2
+  GIT_DEPTH: "10"
+
+test:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    PIP_ROOT_USER_ACTION: ignore
+  script:
+    - pip install --progress-bar off -r requirements.txt
+    - pytest -q
+
+build-gate:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  before_script:
+    # dind can lag behind job start; wait for the daemon before anything.
+    - |
+      for i in $(seq 1 60); do
+        docker info >/dev/null 2>&1 && break
+        echo "Waiting for Docker daemon at $DOCKER_HOST ($i/60)..."; sleep 2
+      done
+      docker info >/dev/null 2>&1 || { echo "ERROR: Docker daemon unreachable at $DOCKER_HOST" >&2; exit 1; }
+    # Registry auth: a "gitlab-deploy-token" deploy token if present, else
+    # the job-token pair. Never hardcode gitlab-ci-token with a custom
+    # password: the pair must match.
+    - |
+      if [ -n "$CI_DEPLOY_USER" ] && [ -n "$CI_DEPLOY_PASSWORD" ]; then
+        REG_USER="$CI_DEPLOY_USER"; REG_PASS="$CI_DEPLOY_PASSWORD"
+      else
+        REG_USER="$CI_REGISTRY_USER"; REG_PASS="$CI_REGISTRY_PASSWORD"
+      fi
+      printf "%s" "$REG_PASS" | docker login "$CI_REGISTRY" -u "$REG_USER" --password-stdin
+    # QEMU binfmt inside dind so the amd64 runner can build the arm64 slice.
+    - docker run --privileged --rm tonistiigi/binfmt --install arm64
+    - docker buildx create --name ci-builder --driver docker-container --use
+  script:
+    # amd64+arm64, attestations off (GitLab registry blob-unknown race),
+    # pushed to $NEKO_SUDO_IMAGE:latest — see the script.
+    - deploy/build-multiarch.sh latest
+  rules:
+    # Never publish from a merge request pipeline.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main"'

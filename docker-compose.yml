@@ -1,0 +1,44 @@
+# neko-sudo gate on Docker Swarm.
+# Deploy: docker stack deploy -c docker-compose.yml neko-sudo
+# A TLS-terminating reverse proxy (e.g. nginx) forwards
+# https://sudo.example.com -> this service's published port. TLS ends at the
+# proxy; the gate speaks plain HTTP on the overlay network only.
+#
+# Replace sudo.example.com, the registry path and the VAPID contact with
+# your own values before deploying.
+services:
+  gate:
+    image: registry.example.com/neko-sudo/gate:latest
+    build: .
+    environment:
+      NEKO_SUDO_ORIGIN: "https://sudo.example.com"
+      NEKO_SUDO_RP_ID: "sudo.example.com"
+      NEKO_SUDO_PUSH_SUBJECT: "mailto:admin@example.com"
+      NEKO_SUDO_DB: "/data/gate.sqlite3"
+      NEKO_SUDO_PASSKEYS: "/data/console-passkeys.json"
+      NEKO_SUDO_SESSIONS: "/data/sessions.json"
+      NEKO_SUDO_TOKENS_FILE: "/data/tokens.conf"
+    volumes:
+      - /srv/neko-sudo:/data
+    ports:
+      - target: 8000        # pick the high port your proxy forwards to
+        published: 18443
+        protocol: tcp
+        mode: ingress       # routing mesh: EVERY node listens on 18443 and
+                            # forwards to whichever node runs the task, so
+                            # the task can float without moving the listener.
+                            # Only let it float if /srv/neko-sudo is shared
+                            # or replicated across nodes; otherwise add a
+                            # placement constraint pinning the gate to the
+                            # node that holds the data.
+    deploy:
+      replicas: 1           # single replica: SQLite + JSON stores are node-local
+      restart_policy:
+        condition: on-failure
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
