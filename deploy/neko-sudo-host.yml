@@ -1,0 +1,120 @@
+# neko-sudo host bootstrap: agent account, public key, wrapper, sudoers, token.
+#
+#   ansible-playbook -i <host>, deploy/neko-sudo-host.yml \
+#       -e neko_sudo_agent_pubkey="$(cat agent.pub)"
+#
+# Idempotent: re-running never clobbers an existing config token, sudoers
+# file (install.sh guarantees both), or other keys in authorized_keys.
+#
+# After the run, ONE gate-side step remains (manual, by design — the gate's
+# tokens.conf is root-owned on the gate host and read at boot only):
+#   1. add the printed "<host> <sha256>" line to the gate's tokens.conf
+#   2. bounce the gate from a manager: docker service update --force neko-sudo_gate
+---
+- name: Bootstrap the neko-sudo host wrapper
+  hosts: all
+  become: true
+  vars:
+    neko_sudo_agent: agent
+    neko_sudo_agent_pubkey: ""   # REQUIRED: public key for the agent account
+    neko_sudo_token: ""          # optional: reuse a known raw token instead of minting
+    neko_sudo_staging: /root/.cache/neko-sudo-staging
+  tasks:
+    - name: Require the agent public key up front (fail closed, not halfway)
+      ansible.builtin.assert:
+        that: neko_sudo_agent_pubkey | length > 0
+        msg: >-
+          pass -e neko_sudo_agent_pubkey='ssh-ed25519 AAAA... agent@host'
+          (the agent cannot be reached without it)
+
+    - name: Surface the python3 prerequisite early — wrapper and modules need it
+      ansible.builtin.command: python3 --version
+      changed_when: false
+
+    - name: Create the agent account with a home directory
+      ansible.builtin.user:
+        name: "{{ neko_sudo_agent }}"
+        create_home: true
+        shell: /bin/bash
+
+    - name: Deploy the agent public key (append; never purge other keys)
+      ansible.builtin.authorized_key:
+        user: "{{ neko_sudo_agent }}"
+        key: "{{ neko_sudo_agent_pubkey }}"
+        exclusive: false
+
+    - name: Mint a raw host token on the controller when none supplied
+      ansible.builtin.command: openssl rand -hex 32
+      delegate_to: localhost
+      run_once: true
+      register: neko_sudo_mint
+      changed_when: false
+      when: neko_sudo_token | length == 0
+      no_log: true
+
+    - name: Resolve the token in use (provided or minted)
+      ansible.builtin.set_fact:
+        neko_sudo_token_live: >-
+          {{ neko_sudo_token if neko_sudo_token | length > 0 else neko_sudo_mint.stdout }}
+      no_log: true
+
+    # install.sh resolves its sources relative to itself (../hostside,
+    # deploy/neko-sudo.conf.template), so stage that exact layout first.
+    - name: Stage the hostside tree
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../hostside"
+        dest: "{{ neko_sudo_staging }}/"
+        mode: preserve
+
+    - name: Stage the installer assets
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ neko_sudo_staging }}/deploy/"
+        mode: preserve
+      loop:
+        - "{{ playbook_dir }}/install.sh"
+        - "{{ playbook_dir }}/neko-sudo.conf.template"
+
+    - name: Run the installer (idempotent; sudoers validated via visudo before activation)
+      ansible.builtin.command: sh {{ neko_sudo_staging }}/deploy/install.sh {{ neko_sudo_agent }}
+
+    - name: Is the config token still the first-run placeholder?
+      ansible.builtin.command: grep -q '^token *= *REPLACE_WITH_HOST_TOKEN' /usr/local/etc/neko-sudo.conf
+      register: neko_sudo_fresh
+      changed_when: false
+      failed_when: false
+
+    - name: Write the host token (first run only — never clobber a live secret)
+      ansible.builtin.lineinfile:
+        path: /usr/local/etc/neko-sudo.conf
+        regexp: '^token *=.*'
+        line: 'token = {{ neko_sudo_token_live }}'
+        owner: root
+        group: root
+        mode: "0600"
+      when: neko_sudo_fresh.rc == 0
+      no_log: true
+
+    - name: Label requests with the real agent account (payload-bound field)
+      ansible.builtin.lineinfile:
+        path: /usr/local/etc/neko-sudo.conf
+        regexp: '^user *=.*'
+        line: 'user = {{ neko_sudo_agent }}'
+
+    - name: Read back the host identity (it names the gate tokens.conf line)
+      ansible.builtin.command: sed -n 's/^host *= *//p' /usr/local/etc/neko-sudo.conf
+      register: neko_sudo_host_id
+      changed_when: false
+
+    - name: Gate-side step — add this line to tokens.conf, then bounce the gate
+      ansible.builtin.debug:
+        msg: >-
+          {{ neko_sudo_host_id.stdout | trim }}
+          {{ neko_sudo_token_live | hash('sha256') }}
+          — add to the gate's tokens.conf (read at boot only), then run
+          'docker service update --force neko-sudo_gate' on a manager node.
+
+    - name: Remove the staging tree
+      ansible.builtin.file:
+        path: "{{ neko_sudo_staging }}"
+        state: absent
