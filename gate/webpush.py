@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 import time
 from datetime import UTC, datetime
@@ -105,13 +106,15 @@ class WebPushPush:
         argv = " ".join(request.get("argv", []))
         if len(argv) > 120:
             argv = argv[:117] + "..."
+        request_id = request.get("id")
+        review_url = "/"
+        if isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", request_id):
+            review_url = f"/#review={request_id}"
         payload = {
             "title": "neko-sudo: approval needed",
             "body": f"{request.get('host', '?')} \u00b7 {argv}",
-            # Tap target is the console PAGE, not the JSON API: the page
-            # renders a login flow for cold sessions and polls pending
-            # cards every 5s, so a tap always lands somewhere actionable.
-            "url": "/",
+            # Select this request on the sign-in-aware page, never a JSON route.
+            "url": review_url,
         }
         return json.dumps(payload)
 
