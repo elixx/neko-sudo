@@ -6,7 +6,15 @@ Builds one FastAPI app containing the host-facing /v1 API
 
     NEKO_SUDO_ORIGIN       https://sudo.example.com   (required)
     NEKO_SUDO_RP_ID        sudo.example.com          (default: ORIGIN host)
-    NEKO_SUDO_DB           /data/gate.sqlite3           requests DB
+    NEKO_SUDO_STATE        /data/state/gate.sqlite3     node-local live db
+                           (unset = legacy single-file layout; the state
+                           subtree must be excluded from replication on
+                           every node sharing the data dir first)
+    NEKO_SUDO_SNAPSHOTS    /data/snapshots              replicated snapshot
+                           dir (only with NEKO_SUDO_STATE)
+    NEKO_SUDO_SNAPSHOT_KEEP  100                        snapshots retained
+    NEKO_SUDO_DB           /data/gate.sqlite3           requests DB (legacy
+                           layout; with STATE: first-boot import source)
     NEKO_SUDO_PASSKEYS     /data/console-passkeys.json  passkey store
     NEKO_SUDO_SESSIONS     /data/sessions.json          session persist (hashes)
     NEKO_SUDO_TOKENS_FILE  /data/tokens.conf            "host sha256hex" lines
@@ -72,6 +80,29 @@ def build_app(*, env: dict[str, str] | None = None) -> "object":
 
     data_dir = DEFAULT_DATA_DIR
     db_path = Path(config.get("NEKO_SUDO_DB", data_dir / "gate.sqlite3"))
+    # NEKO_SUDO_STATE moves the live db to node-local storage and
+    # publishes generation-stamped snapshots to the replicated snapshots
+    # dir after every commit. NEKO_SUDO_DB then only names the legacy
+    # single-file db to import from on the first boot with STATE set.
+    snapshots_dir = None
+    snapshot_keep = 100
+    state_env = config.get("NEKO_SUDO_STATE", "").strip()
+    if state_env:
+        from gate.store import reconcile_state
+
+        state_path = Path(state_env)
+        snapshots_dir = Path(config.get(
+            "NEKO_SUDO_SNAPSHOTS", db_path.parent / "snapshots"))
+        try:
+            snapshot_keep = max(1, int(
+                config.get("NEKO_SUDO_SNAPSHOT_KEEP", "100")))
+        except ValueError:
+            snapshot_keep = 100
+        legacy_source = db_path if db_path != state_path else None
+        source = reconcile_state(
+            state_path, snapshots_dir, legacy_path=legacy_source)
+        db_path = state_path
+        print(f"neko-sudo: boot state source={source}", file=sys.stderr)
     passkeys_path = Path(config.get(
         "NEKO_SUDO_PASSKEYS", data_dir / "console-passkeys.json"))
     sessions_path = Path(config.get(
@@ -91,7 +122,15 @@ def build_app(*, env: dict[str, str] | None = None) -> "object":
     for parent in (db_path, passkeys_path, sessions_path):
         parent.parent.mkdir(parents=True, exist_ok=True)
 
-    request_store = RequestStore(db_path)
+    request_store = RequestStore(
+        db_path,
+        snapshots_dir=snapshots_dir,
+        snapshot_keep=snapshot_keep,
+    )
+    if state_env:
+        print(f"neko-sudo: live generation={request_store.generation()} "
+              f"keep={snapshot_keep} snapshots={snapshots_dir}",
+              file=sys.stderr)
     passkeys = ConsolePasskeyStore(passkeys_path)
     sessions = SessionStore(path=sessions_path)
     tokens = load_token_hashes(tokens_file)

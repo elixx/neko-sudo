@@ -14,6 +14,18 @@ services:
       NEKO_SUDO_ORIGIN: "https://sudo.example.com"
       NEKO_SUDO_RP_ID: "sudo.example.com"
       NEKO_SUDO_PUSH_SUBJECT: "mailto:admin@example.com"
+      # Node-local state: the live db lives at /data/state/gate.sqlite3 —
+      # every commit publishes a generation-stamped snapshot to
+      # /data/snapshots (replicate that directory between nodes).
+      # The state subtree is NEVER replicated: exclude
+      # /data/state from replication on every node sharing the data dir
+      # BEFORE the gate first writes there. NEKO_SUDO_DB only names the
+      # legacy single-file db, imported automatically on the first boot
+      # with STATE set (then renamed gate.sqlite3.imported-<ts>, never
+      # deleted).
+      NEKO_SUDO_STATE: "/data/state/gate.sqlite3"
+      NEKO_SUDO_SNAPSHOTS: "/data/snapshots"
+      NEKO_SUDO_SNAPSHOT_KEEP: "100"
       NEKO_SUDO_DB: "/data/gate.sqlite3"
       NEKO_SUDO_PASSKEYS: "/data/console-passkeys.json"
       NEKO_SUDO_SESSIONS: "/data/sessions.json"
@@ -25,12 +37,11 @@ services:
         published: 18443
         protocol: tcp
         mode: ingress       # routing mesh: EVERY node listens on 18443 and
-                            # forwards to whichever node runs the task, so
-                            # the task can float without moving the listener.
-                            # Only let it float if /srv/neko-sudo is shared
-                            # or replicated across nodes; otherwise add a
-                            # placement constraint pinning the gate to the
-                            # node that holds the data.
+                            # forwards to whichever node runs the task. The
+                            # live db is node-local: a task that floats to a
+                            # node without local state boots from the newest
+                            # replicated snapshot (generation-ordered boot
+                            # reconcile), losing at most the replication lag.
     deploy:
       replicas: 1           # single replica: SQLite + JSON stores are node-local
       restart_policy:
