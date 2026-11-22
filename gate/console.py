@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import time
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse
@@ -440,7 +441,8 @@ def build_console_router(
         if not raw or sessions.check(raw) is None:
             return Response(status_code=404, content="Not Found",
                             media_type="text/plain")
-        return Response(content=_CONSOLE_JS, media_type="application/javascript")
+        return Response(content=_REVIEW_JS + "\n" + _CONSOLE_JS,
+                        media_type="application/javascript")
 
     @router.get("/signin.js", include_in_schema=False)
     def signin_js() -> Response:
@@ -629,6 +631,28 @@ _INDEX_HTML = """<!doctype html>
  #history th,#history td{text-align:left;padding:.35rem .5rem;border-bottom:1px solid #333;vertical-align:top}
  #history td.cmd{font-family:ui-monospace,monospace;word-break:break-all}
  .s-approved{color:#4d8}.s-denied{color:#e66}.s-expired{color:#999}
+ [hidden]{display:none!important}
+ .history-command{font:inherit;color:#bcd3f8;margin:0;padding:.25rem .4rem;text-align:left;max-width:100%;overflow-wrap:anywhere;word-break:normal}
+ #command-review{box-sizing:border-box;width:100%;max-width:none;height:100vh;height:100dvh;max-height:none;
+   margin:0;inset:0;border:0;padding:0;background:#10141d;color:#edf1f8;overflow:hidden;color-scheme:dark}
+ #command-review[open]{display:grid;grid-template-rows:auto minmax(0,1fr) auto}
+ #command-review header,#command-review footer{background:#191f2c;padding:.75rem max(1rem,calc((100% - 48rem) / 2));}
+ #command-review header{border-bottom:1px solid #374055;display:flex;gap:.8rem;align-items:center;justify-content:space-between}
+ #command-review h2,#command-review h3{margin:.15rem 0 .35rem}
+ #command-review #review-close{flex:none;margin:0}
+ #review-body{overflow:auto;overscroll-behavior:contain;padding:1rem max(1rem,calc((100% - 48rem) / 2));min-width:0}
+ #review-meta{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.45rem .8rem;margin:0 0 1.1rem}
+ #review-meta dt{color:#b3bfd3} #review-meta dd{margin:0;overflow-wrap:anywhere}
+ #command-review pre{background:#0a0e16;border:1px solid #364157;border-radius:.5rem;padding:.8rem;
+   font: .94rem/1.55 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;direction:ltr;unicode-bidi:isolate}
+ #review-script-text span{display:block}
+ #command-review details{margin:1rem 0} #command-review summary{cursor:pointer;color:#c4dcff}
+ #command-review footer{border-top:1px solid #374055;padding-bottom:max(.75rem,env(safe-area-inset-bottom));}
+ #review-actions{display:flex;gap:.65rem;flex-wrap:wrap} #review-actions button{margin:0;min-height:44px}
+ #review-approve:not(:disabled){background:#15452f;border-color:#52c082}
+ #review-deny:not(:disabled){background:#4e2128;border-color:#e47580}
+ #review-result:empty{display:none} #review-result{margin:.5rem 0 0;overflow-wrap:anywhere}
+ :focus-visible{outline:2px solid #a7ccff;outline-offset:3px}
 </style>
 </head>
 <body>
@@ -650,6 +674,7 @@ _INDEX_HTML = """<!doctype html>
 </div>
 <h2>Pending requests <span id="count" class="muted"></span></h2>
 <div id="empty" class="muted">No pending requests.</div>
+<div id="review-link-status" class="muted" role="status"></div>
 <div id="approvals"></div>
 <h2>Recent requests</h2>
 <table id="history">
@@ -662,10 +687,47 @@ _INDEX_HTML = """<!doctype html>
  <button id="hist-older" disabled>Older &rarr;</button>
  <span id="hist-page" class="muted"></span>
 </div>
+<dialog id="command-review" aria-labelledby="review-title">
+ <header>
+  <div><h2 id="review-title">Command review</h2><div id="review-timing" class="muted"></div></div>
+  <button type="button" id="review-close" autofocus>Close</button>
+ </header>
+ <div id="review-body">
+  <dl id="review-meta">
+   <dt>Host</dt><dd id="review-host"></dd>
+   <dt>Requested by</dt><dd id="review-user"></dd>
+   <dt>Working directory</dt><dd id="review-cwd"></dd>
+   <dt id="review-digest-label">Digest</dt><dd id="review-digest" dir="ltr"></dd>
+  </dl>
+  <section id="review-script" aria-labelledby="review-script-title" hidden>
+   <h3 id="review-script-title">Shell script preview</h3>
+   <div id="review-script-note" class="muted"></div>
+   <pre id="review-script-text"></pre>
+  </section>
+  <details id="review-decoded" hidden>
+   <summary>Decoded Base64 literal (preview only)</summary>
+   <pre id="review-decoded-text"></pre>
+  </details>
+  <details id="review-exact-toggle">
+   <summary>Exact arguments (argv)</summary>
+   <p class="muted">One JSON string per argument. Escapes expose invisible characters.</p>
+   <pre id="review-exact"></pre>
+  </details>
+ </div>
+ <footer>
+  <div id="review-actions" hidden>
+   <button type="button" id="review-approve" class="ok">Approve with passkey</button>
+   <button type="button" id="review-deny" class="deny">Deny</button>
+  </div>
+  <p id="review-result" role="status"></p>
+ </footer>
+</dialog>
 <script src="/console.js"></script>
 </body>
 </html>
 """
+
+_REVIEW_JS = Path(__file__).with_name("command_review.js").read_text(encoding="utf-8")
 
 _CONSOLE_JS = """'use strict';
 // base64url <-> ArrayBuffer helpers (WebAuthn speaks ArrayBuffers)
@@ -680,19 +742,35 @@ async function api(path,opts={}){
 }
 
 const $=(id)=>document.getElementById(id);
-let histPage=0;
+let histPage=0, historySeq=0, historyKey='', pendingKey='';
+let refreshing=false;
 
 async function refresh(){
+  if(refreshing)return;
+  refreshing=true;
   try{
     const {pending}=await api('/approvals');
     $('empty').hidden=pending.length>0;
     $('count').textContent=pending.length?`(${pending.length})`:'';
-    const box=$('approvals');box.innerHTML='';
-    for(const r of pending)box.appendChild(card(r));
+    pendingReadAt=performance.now();
+    pendingReviews=pending;
+    const key=JSON.stringify(pending.map(r=>r.id));
+    if(key!==pendingKey){
+      $('approvals').replaceChildren(...pending.map(card));
+      pendingKey=key;
+    }
+    if(activeReview?.pending && !pending.some(r=>r.id===activeReview.request.id)){
+      activeReview.ended=true;
+      updateReviewButtons();
+    }
+    syncLinkedReview();
     loadHistory(histPage);
   }catch(e){
-    if(e.code==='not_signed_in'){$('who').textContent='';return}
-  }
+    if(e.code==='not_signed_in'){
+      $('who').textContent='';
+      if(activeReview?.pending){activeReview.ended=true;updateReviewButtons()}
+    }
+  }finally{refreshing=false}
 }
 
 // History cells carry agent-controlled strings (argv, host, cwd): build
@@ -700,18 +778,29 @@ async function refresh(){
 function cell(text,cls){const td=document.createElement('td');td.textContent=text;if(cls)td.className=cls;return td}
 
 async function loadHistory(page){
+  histPage=page;
+  const seq=++historySeq;
   try{
     const h=await api(`/history?page=${page}`);
+    if(seq!==historySeq)return;
     const pages=Math.max(1,Math.ceil(h.total/h.page_size));
     if(h.page>0&&h.page>=pages)return loadHistory(pages-1);
-    histPage=h.page;
-    const rows=$('history-rows');rows.replaceChildren();
-    for(const r of h.items){
-      const tr=document.createElement('tr');
-      tr.title=`user ${r.user} · cwd ${r.cwd}`;
-      tr.append(cell(new Date(r.created_at*1000).toLocaleString()),cell(r.host),
-        cell(r.argv.join(' '),'cmd'),cell(r.status,'s-'+r.status));
-      rows.append(tr);
+    const key=JSON.stringify(h.items.map(r=>r.id));
+    if(key!==historyKey){
+      const rows=$('history-rows');
+      rows.replaceChildren(...h.items.map(r=>{
+        const tr=document.createElement('tr');
+        const cmd=cell('', 'cmd');
+        const show=document.createElement('button');
+        show.type='button';show.className='history-command';
+        show.textContent=commandSummary(r.argv);
+        show.onclick=()=>openReview(r,false);
+        cmd.append(show);
+        tr.append(cell(new Date(r.created_at*1000).toLocaleString()),cell(visibleText(r.host)),
+          cmd,cell(r.status,'s-'+r.status));
+        return tr;
+      }));
+      historyKey=key;
     }
     $('history').hidden=h.total===0;
     $('hist-empty').hidden=h.total>0;
@@ -731,37 +820,32 @@ function card(r){
   const el=(tag,text,cls)=>{const e=document.createElement(tag);if(text!=null)e.textContent=text;if(cls)e.className=cls;return e};
   const d=el('div',null,'card');
   const head=el('div');
-  head.append(el('b',r.host),' · user ',el('code',r.user),` · expires in ${r.seconds_left}s`);
-  const cmd=el('div');cmd.style.margin='.4rem 0';
-  r.argv.forEach((a,i)=>{if(i)cmd.append(' ');cmd.append(el('code',a))});
-  const meta=el('div',null,'muted');
-  meta.append('cwd ',el('code',r.cwd),' · digest ',el('code',r.digest.slice(0,16)+'…'));
-  const ok=el('button','Approve','ok'),deny=el('button','Deny','deny');
-  const actions=el('div');actions.style.marginTop='.6rem';actions.append(ok,deny);
-  d.append(head,cmd,meta,actions);
-  ok.onclick=()=>approve(r.id,d);
-  deny.onclick=()=>{api(`/approvals/${r.id}/deny`,{method:'POST'}).then(refresh).catch(alert)};
+  head.append(el('b',visibleText(r.host)),' · user ',el('code',visibleText(r.user)));
+  const cmd=el('p');cmd.append(el('code',commandSummary(r.argv)));
+  const review=el('button','Review command');
+  review.type='button';
+  review.onclick=()=>{
+    const current=pendingReviews.find(item=>item.id===r.id);
+    if(current)openReview(current,true);
+  };
+  d.append(head,cmd,review);
   return d;
 }
 
-async function approve(id,el){
-  try{
-    const {challenge_id,options}=await api(`/approvals/${id}/approve/options`,{method:'POST'});
-    const cred=await navigator.credentials.get({publicKey:{
-      challenge:b64uToBuf(options.challenge),
-      rpId:options.rpId,timeout:options.timeout,userVerification:options.userVerification,
-      allowCredentials:(options.allowCredentials||[]).map(c=>({type:c.type,id:b64uToBuf(c.id)})),
-    }});
-    const response=JSON.parse(new TextDecoder().decode(cred.response.clientDataJSON));
-    await api(`/approvals/${id}/approve`,{method:'POST',body:JSON.stringify({
-      challenge_id,
-      credential_id:cred.id,
-      client_data_json:bufToB64u(cred.response.clientDataJSON),
-      authenticator_data:bufToB64u(cred.response.authenticatorData),
-      signature:bufToB64u(cred.response.signature),
-    })});
-    refresh();
-  }catch(e){alert('Approve failed: '+(e.code||e.message));refresh()}
+async function approve(id){
+  const {challenge_id,options}=await api(`/approvals/${id}/approve/options`,{method:'POST'});
+  const cred=await navigator.credentials.get({publicKey:{
+    challenge:b64uToBuf(options.challenge),
+    rpId:options.rpId,timeout:options.timeout,userVerification:options.userVerification,
+    allowCredentials:(options.allowCredentials||[]).map(c=>({type:c.type,id:b64uToBuf(c.id)})),
+  }});
+  await api(`/approvals/${id}/approve`,{method:'POST',body:JSON.stringify({
+    challenge_id,
+    credential_id:cred.id,
+    client_data_json:bufToB64u(cred.response.clientDataJSON),
+    authenticator_data:bufToB64u(cred.response.authenticatorData),
+    signature:bufToB64u(cred.response.signature),
+  })});
 }
 
 async function signIn(){
@@ -881,6 +965,7 @@ async function syncPush(){
       if(err.code==='no_passkeys')$('enroll').hidden=false;
     }
   }
+  initReview();
   refresh();setInterval(refresh,5000);
 })();
 """

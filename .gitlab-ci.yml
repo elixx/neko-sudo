@@ -36,6 +36,8 @@ test:
   variables:
     PIP_DISABLE_PIP_VERSION_CHECK: "1"
     PIP_ROOT_USER_ACTION: ignore
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends nodejs
   script:
     - pip install --progress-bar off -r requirements.txt
     - pytest -q

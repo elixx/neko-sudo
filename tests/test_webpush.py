@@ -72,9 +72,9 @@ def test_notifies_every_subscription_with_actionable_payload(store, keys):
     sub_a, payload, ttl = rec.calls[0]
     assert payload["title"] == "neko-sudo: approval needed"
     assert "web01" in payload["body"] and "apt update" in payload["body"]
-    # A notification tap must land on the console PAGE (login-aware,
-    # polls pending cards every 5s) — never on a JSON API route.
-    assert payload["url"] == "/"
+    # A tap selects the exact pending request in the login-aware console,
+    # never the JSON route or a different pending request.
+    assert payload["url"] == "/#review=req-9"
     assert ttl == 100, "expires_at 2000 with now=1900"
 
 
