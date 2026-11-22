@@ -146,9 +146,21 @@ docker stack deploy -c docker-compose.yml neko-sudo
 ```
 
 Point your reverse proxy at the published port (18443 by default). The
-service is a single replica because its stores are local files. Only let the
-task float between nodes if the data directory is shared or replicated;
-otherwise pin it with a placement constraint.
+service is a single replica because its stores are local files. The live
+db is node-local: a task that floats to a node without local state boots
+from the newest replicated snapshot, so floating is safe as long as the
+snapshots below are replicated between nodes.
+
+Data layout under the data directory (bind-mounted to `/data`):
+
+- `/srv/neko-sudo/state/` — node-local live db and quarantine forensics.
+  Under the data root but NEVER replicated: exclude it from replication on
+  every node sharing the data directory BEFORE the gate first writes there.
+- `/srv/neko-sudo/snapshots/` — replicated `gate-<gen>-<ts>.db` snapshots,
+  keep 100, pruned by generation. Replicate this directory between
+  nodes so any node can boot the gate from it.
+
+Unset `NEKO_SUDO_STATE` for the legacy single-file layout.
 
 ### 3. Enroll your passkey
 
