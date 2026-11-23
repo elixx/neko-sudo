@@ -142,8 +142,10 @@ def test_pending_requests_lists_only_live_pending(tmp_path):
     newer = store.create_request(
         host="db01", user="agent", argv=["systemctl", "restart", "pg"], cwd="/tmp", ttl_s=300
     )
+    # Own host: a later web01 request can't be decided while
+    # `older` is pending, and this test is only about listing.
     decided = store.create_request(
-        host="web01", user="agent", argv=["true"], cwd="/tmp", ttl_s=120
+        host="cache01", user="agent", argv=["true"], cwd="/tmp", ttl_s=120
     )
     store.decide(decided["id"], "deny")
 

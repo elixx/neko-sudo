@@ -1,13 +1,14 @@
 """The owner-facing side of same-host ordering.
 
-Approving B is refused while an earlier same-host
-request is still pending (before any passkey ceremony is spent); deny is
-always allowed. Cards, the review screen and the push say where a request
+Only the first pending request of a host's series can be decided: approve
+and deny on a later one are refused (before any passkey ceremony is
+spent). Cards, the review screen and the push say where a request
 sits in its host's queue ("2 of 3 pending on <host>").
 """
 from __future__ import annotations
 
 from test_console import (
+    ORIGIN,
     auth,
     enroll_owner_passkey,
     login,
@@ -97,13 +98,70 @@ def test_approve_checks_order_before_spending_the_challenge(tmp_path):
     assert res.status_code == 200, res.text
 
 
-def test_deny_allowed_while_earlier_same_host_pending(tmp_path):
+def test_deny_refused_while_earlier_same_host_pending(tmp_path):
+    """Only a decision on the first card of a series is possible, so
+    deny is refused like approve."""
+    client, store, _, raw = signed_in(tmp_path)
+    a = create(store, argv=["stop"])
+    b = create(store, argv=["start"])
+    res = client.post(f"/approvals/{b['id']}/deny", headers=auth(raw))
+    assert res.status_code == 409, res.text
+    assert res.json()["detail"]["code"] == "earlier_pending"
+    assert res.json()["detail"]["earlier"] == [{"id": a["id"], "argv": ["stop"]}]
+    assert store.get_request(b["id"])["status"] == "pending"
+    assert client.post(f"/approvals/{a['id']}/deny", headers=auth(raw)).status_code == 200
+    assert client.post(f"/approvals/{b['id']}/deny", headers=auth(raw)).status_code == 200
+
+
+def test_raced_deny_maps_to_409_not_500(tmp_path):
     client, store, _, raw = signed_in(tmp_path)
     create(store)
     b = create(store)
-    res = client.post(f"/approvals/{b['id']}/deny", headers=auth(raw))
-    assert res.status_code == 200
-    assert res.json()["status"] == "denied"
+    real = store.earlier_pending
+    store.earlier_pending = lambda request_id: []  # bypass the pre-check
+    try:
+        res = client.post(f"/approvals/{b['id']}/deny", headers=auth(raw))
+    finally:
+        store.earlier_pending = real
+    assert res.status_code == 409, res.text
+    assert res.json()["detail"]["code"] == "earlier_pending"
+    assert store.get_request(b["id"])["status"] == "pending"
+
+
+# ---------------------------------------------------------- stale console
+
+def test_approvals_and_console_js_carry_the_same_build_id(tmp_path):
+    import re
+
+    from gate.console import BUILD_ID
+
+    client, _, _, raw = signed_in(tmp_path)
+    assert re.fullmatch(r"[0-9a-f]{16}", BUILD_ID)
+    assert client.get("/approvals", headers=auth(raw)).json()["build"] == BUILD_ID
+    js = client.get("/console.js", headers=auth(raw)).text
+    assert js.count(f"const PAGE_BUILD='{BUILD_ID}';") == 1
+
+
+def test_console_page_and_script_are_never_cached(tmp_path):
+    """A cached console.js would make the build-id reload loop forever.
+    The sign-in page, its script and the service worker follow suit."""
+    client, _, _, raw = signed_in(tmp_path)
+    for path in ("/", "/console.js", "/signin.js", "/sw.js"):
+        res = client.get(path, headers=auth(raw))
+        assert res.status_code == 200
+        assert res.headers.get("cache-control") == "no-store", path
+    anonymous = client.get("/", headers={"origin": ORIGIN})
+    assert "console.js" not in anonymous.text
+    assert anonymous.headers.get("cache-control") == "no-store"
+
+
+def test_served_console_script_keeps_strict_mode(tmp_path):
+    """Anything prepended before 'use strict' demotes the directive and
+    runs the whole console (agent-controlled rendering included) in
+    sloppy mode. The directive must stay the first line."""
+    client, _, _, raw = signed_in(tmp_path)
+    js = client.get("/console.js", headers=auth(raw)).text
+    assert js.split("\n", 1)[0] == "'use strict';"
 
 
 def test_cards_carry_queue_position_and_earlier_requests(tmp_path):
