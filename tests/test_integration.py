@@ -113,3 +113,56 @@ def test_wrong_token_fails_closed(gate):
     assert code == 1
     assert executed == []
     assert not gate["push"].event.is_set(), "no request may be created for an unknown token"
+
+
+def test_same_host_requests_start_in_submission_order(gate):
+    """Same-host order end to end: real wrappers over real HTTP. A's wrapper polls at
+    the production 2 s interval, B's every 50 ms. The owner decides A,
+    then B straight away. Without the gate's hold, B's wrapper sees its
+    approval first and runs before A (a stop/start pair inverted)."""
+    from gate.store import EarlierPending
+
+    store = gate["store"]
+    started = []
+    results = {}
+
+    def wrapper(key, argv, poll_interval_s):
+        client = GateClient(gate["url"], token="tok-web01", timeout_s=5)
+        results[key] = run(
+            argv,
+            host="web01",
+            user="agent",
+            cwd="/home/agent",
+            client=client,
+            clock=time.time,
+            sleep=time.sleep,
+            ttl_s=60,
+            poll_interval_s=poll_interval_s,
+            exec_fn=lambda resolved: started.append(resolved[1:]),
+            which=lambda name: f"/usr/bin/{name}",
+        )
+
+    def wait_pending(n):
+        deadline = time.time() + 5
+        while len(store.pending_requests()) < n:
+            assert time.time() < deadline, f"never saw {n} pending requests"
+            time.sleep(0.02)
+
+    first = threading.Thread(target=wrapper, args=("a", ["systemctl", "stop", "x"], 2.0))
+    first.start()
+    wait_pending(1)
+    second = threading.Thread(target=wrapper, args=("b", ["systemctl", "start", "x"], 0.05))
+    second.start()
+    wait_pending(2)
+    a, b = sorted(store.pending_requests(), key=lambda r: r["host_seq"])
+
+    with pytest.raises(EarlierPending):
+        store.decide(b["id"], "approve")
+    store.decide(a["id"], "approve")
+    store.decide(b["id"], "approve")
+    for thread in (first, second):
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "wrapper did not terminate"
+
+    assert started == [["stop", "x"], ["start", "x"]]
+    assert results == {"a": (0, "approved"), "b": (0, "approved")}
