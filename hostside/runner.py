@@ -4,6 +4,8 @@ Every path except "owner approved the exact argv we submitted" returns
 exit code 1. Fail closed, always.
 """
 
+from __future__ import annotations
+
 import os
 import shutil
 

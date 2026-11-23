@@ -5,6 +5,8 @@ wrapper is a standalone script; tests/test_digest_parity.py pins the two
 together.
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 

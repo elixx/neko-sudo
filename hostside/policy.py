@@ -5,6 +5,8 @@ owner would approve: those forms make "exact argv" meaningless. Anything
 else goes to the gate and is approved as the exact argv on the card.
 """
 
+from __future__ import annotations
+
 import os
 
 SHELLS = {

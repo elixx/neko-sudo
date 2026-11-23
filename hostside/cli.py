@@ -5,6 +5,8 @@ module). Reads an INI config, builds the real HTTP client, and hands
 off to runner.run — which fails closed on everything.
 """
 
+from __future__ import annotations
+
 import configparser
 import dataclasses
 import os
