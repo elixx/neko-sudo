@@ -24,9 +24,9 @@ Fail-closed rules baked in:
 * Approval completion requires a fresh user-verified passkey assertion —
   a signed-in cookie alone can only deny.
 * Cross-site POSTs (Origin / Sec-Fetch-Site) are rejected outright.
-* Same-host order: approve is refused with 409 ``earlier_pending``
-  while an earlier request from the same host is still pending, before
-  any passkey ceremony starts. Deny is always allowed.
+* Same-host order: only the first pending request of a host's
+  series can be decided. Approve and deny on a later one answer 409
+  ``earlier_pending``, before any passkey ceremony starts.
 """
 
 from __future__ import annotations
@@ -195,7 +195,7 @@ def build_console_router(
         return [{"id": r["id"], "argv": r["argv"]} for r in requests]
 
     def require_in_order(request_id: str) -> None:
-        """Same-host order: no approve, and no passkey ceremony
+        """Same-host order: no decision (approve or deny), and no passkey ceremony
         spent on one, while an earlier same-host request is pending."""
         earlier = request_store.earlier_pending(request_id)
         if earlier:
@@ -357,7 +357,9 @@ def build_console_router(
     @router.get("/approvals")
     def list_approvals(request: Request):
         _, _ = session_of(request)
-        return {"pending": [card(r) for r in request_store.pending_requests()]}
+        # build: lets an open console notice a redeploy and reload.
+        return {"pending": [card(r) for r in request_store.pending_requests()],
+                "build": BUILD_ID}
 
     @router.get("/history")
     def history(request: Request, page: int = Query(0, ge=0)):
@@ -392,6 +394,7 @@ def build_console_router(
         require_same_origin(request)
         session_of(request)
         pending_or_4xx(request_id, decided_status=409)
+        require_in_order(request_id)
         return {"status": decide(request_id, "deny")["status"]}
 
     @router.post("/approvals/{request_id}/approve/options")
@@ -458,8 +461,8 @@ def build_console_router(
         record = sessions.check(raw) if raw else None
         if record is None:
             # Anonymous visitors: plain page, zero service details.
-            return HTMLResponse(_SIGNIN_HTML)
-        return HTMLResponse(_INDEX_HTML)
+            return HTMLResponse(_SIGNIN_HTML, headers=NO_STORE)
+        return HTMLResponse(_INDEX_HTML, headers=NO_STORE)
 
     @router.get("/console.js", include_in_schema=False)
     def console_js(request: Request) -> Response:
@@ -467,18 +470,20 @@ def build_console_router(
         if not raw or sessions.check(raw) is None:
             return Response(status_code=404, content="Not Found",
                             media_type="text/plain")
-        return Response(content=_REVIEW_JS + "\n" + _CONSOLE_JS,
-                        media_type="application/javascript")
+        return Response(content=_SERVED_CONSOLE_JS,
+                        media_type="application/javascript", headers=NO_STORE)
 
     @router.get("/signin.js", include_in_schema=False)
     def signin_js() -> Response:
-        return Response(content=_SIGNIN_JS, media_type="application/javascript")
+        return Response(content=_SIGNIN_JS, media_type="application/javascript",
+                        headers=NO_STORE)
 
     # ------------------------------------------------------- push notify
 
     @router.get("/sw.js", include_in_schema=False)
     def service_worker() -> Response:
-        return Response(content=_SW_JS, media_type="application/javascript")
+        return Response(content=_SW_JS, media_type="application/javascript",
+                        headers=NO_STORE)
 
     def push_or_503():
         if push_subscriptions is None or push_keys is None:
@@ -683,12 +688,15 @@ _INDEX_HTML = """<!doctype html>
  #review-order p{margin:0 0 .4rem} #review-order ul{margin:0;padding-left:1.1rem}
  #review-order li{overflow-wrap:anywhere;margin:.25rem 0} #review-order button{margin:.25rem 0 0;min-height:44px}
  .queue{color:#f0c27a}
+ #review-series{display:flex;align-items:center;justify-content:space-between;gap:.5rem;margin:0 0 .65rem}
+ #review-series button{margin:0;min-height:44px;min-width:5.5rem} #review-series-label{color:#f0c27a;text-align:center;overflow-wrap:anywhere}
  :focus-visible{outline:2px solid #a7ccff;outline-offset:3px}
 </style>
 </head>
 <body>
 <h1>neko-sudo gate</h1>
 <p class="muted">Privileged command approvals &mdash; every approve needs your passkey.</p>
+<p id="update-status" class="queue" role="status" hidden></p>
 <div id="enroll" hidden>
  <h2>Enroll a passkey</h2>
  <form id="enroll-form">
@@ -718,15 +726,16 @@ _INDEX_HTML = """<!doctype html>
  <button id="hist-older" disabled>Older &rarr;</button>
  <span id="hist-page" class="muted"></span>
 </div>
-<dialog id="command-review" aria-labelledby="review-title">
+<dialog id="command-review" aria-labelledby="review-position review-title">
  <header>
-  <div><h2 id="review-title">Command review</h2><div id="review-timing" class="muted"></div></div>
+  <div><h2><span id="review-position" class="queue" hidden></span> <span id="review-title">Command review</span></h2><div id="review-timing" class="muted"></div></div>
   <button type="button" id="review-close" autofocus>Close</button>
  </header>
  <div id="review-body">
   <section id="review-order" role="status" hidden>
-   <p><b>Decide the earlier request from this host first.</b> Approve unlocks once it is approved, denied or expires. Deny works now.</p>
+   <p><b>Decide the first request from this host first.</b> Approve and Deny unlock here once the earlier request is approved, denied or expires.</p>
    <ul id="review-order-list"></ul>
+   <button type="button" id="review-first">Go to first</button>
   </section>
   <dl id="review-meta">
    <dt>Host</dt><dd id="review-host"></dd>
@@ -751,6 +760,11 @@ _INDEX_HTML = """<!doctype html>
   </details>
  </div>
  <footer>
+  <nav id="review-series" aria-label="Requests from this host" hidden>
+   <button type="button" id="review-prev">&lsaquo; Prev</button>
+   <span id="review-series-label"></span>
+   <button type="button" id="review-next">Next &rsaquo;</button>
+  </nav>
   <div id="review-actions" hidden>
    <button type="button" id="review-approve" class="ok">Approve with passkey</button>
    <button type="button" id="review-deny" class="deny">Deny</button>
@@ -780,12 +794,34 @@ async function api(path,opts={}){
 const $=(id)=>document.getElementById(id);
 let histPage=0, historySeq=0, historyKey='', pendingKey='';
 let refreshing=false;
+// Open WebAuthn ceremonies (approve, sign-in, enroll): a build reload
+// waits until none is open, or it would cancel the passkey prompt.
+let ceremonies=0;
+async function inCeremony(fn){ceremonies++;try{return await fn()}finally{ceremonies--}}
+
+function updateNotice(){
+  const u=$('update-status');
+  u.textContent='The gate was updated. Reload this page to get the new console.';
+  u.hidden=false;
+}
 
 async function refresh(){
   if(refreshing)return;
   refreshing=true;
   try{
-    const {pending}=await api('/approvals');
+    const {pending,build}=await api('/approvals');
+    // The gate was redeployed under this tab; load the new console
+    // (keeping the open review's deep link) instead of running stale code.
+    let store=null;try{store=sessionStorage}catch(_){}
+    const tried=store?triedBuild(store):null;
+    const decision=reloadDecision(build,PAGE_BUILD,Boolean(activeReview?.busy)||ceremonies>0,tried);
+    if(decision==='reload'){
+      try{store.setItem('neko-sudo-build',build)}catch(_){updateNotice();return}
+      if(activeReview?.pending)history.replaceState(null,'',`${location.pathname}${location.search}#review=${activeReview.request.id}`);
+      location.reload();
+      return;
+    }
+    if(decision==='notice')updateNotice();
     $('empty').hidden=pending.length>0;
     $('count').textContent=pending.length?`(${pending.length})`:'';
     pendingReadAt=performance.now();
@@ -807,6 +843,8 @@ async function refresh(){
       activeReview.request.queue=live.queue;
       renderOrder(activeReview.request,true);
       updateReviewButtons();
+    }else if(live){
+      renderSeries(activeReview.request,true);  // the series may have grown or shrunk
     }
     syncLinkedReview();
     loadHistory(histPage);
@@ -880,7 +918,7 @@ function card(r){
   return d;
 }
 
-async function approve(id){
+async function approve(id){return inCeremony(async()=>{
   const {challenge_id,options}=await api(`/approvals/${id}/approve/options`,{method:'POST'});
   const cred=await navigator.credentials.get({publicKey:{
     challenge:b64uToBuf(options.challenge),
@@ -894,9 +932,9 @@ async function approve(id){
     authenticator_data:bufToB64u(cred.response.authenticatorData),
     signature:bufToB64u(cred.response.signature),
   })});
-}
+})}
 
-async function signIn(){
+async function signIn(){return inCeremony(async()=>{
   try{
     const {challenge_id,options}=await api('/login/options',{method:'POST',body:'{}'});
     const cred=await navigator.credentials.get({publicKey:{
@@ -914,12 +952,12 @@ async function signIn(){
     $('who').textContent='signed in: '+label;
     refresh();
   }catch(e){alert('Sign-in failed: '+(e.code||e.message))}
-}
+})}
 
 $('signin-btn').onclick=signIn;
-$('enroll-form').onsubmit=async(ev)=>{
+$('enroll-form').onsubmit=(ev)=>{
   ev.preventDefault();
-  try{
+  return inCeremony(async()=>{try{
     const enroll_code=$('enroll-code').value.trim(),label=$('enroll-label').value.trim();
     const {challenge_id,user_id,options}=await api('/enroll/options',{method:'POST',body:JSON.stringify({enroll_code,label})});
     const cred=await navigator.credentials.create({publicKey:{
@@ -938,7 +976,7 @@ $('enroll-form').onsubmit=async(ev)=>{
     })});
     alert('Passkey enrolled — sign in with it now.');
     $('enroll').hidden=true;
-  }catch(e){alert('Enroll failed: '+(e.code||e.message))}
+  }catch(e){alert('Enroll failed: '+(e.code||e.message))}});
 };
 
 const PUSH_ON='Notifications: on';
@@ -1018,6 +1056,21 @@ async function syncPush(){
 })();
 """
 
+
+
+# An open console tab keeps running the JS it loaded, and a push
+# tap only changes the #fragment, which never reloads it. The build id
+# names the served page + script; /approvals carries it, and the page
+# reloads itself when it differs from the one it was served with.
+BUILD_ID = hashlib.sha256(
+    (_INDEX_HTML + "\0" + _REVIEW_JS + "\0" + _CONSOLE_JS).encode("utf-8")
+).hexdigest()[:16]
+# 'use strict' must stay the first statement: anything before it demotes
+# the directive and the whole console would run in sloppy mode.
+_SERVED_CONSOLE_JS = ("'use strict';\n" + f"const PAGE_BUILD='{BUILD_ID}';\n"
+                      + _REVIEW_JS + "\n" + _CONSOLE_JS)
+# A cached page or script would defeat the reload (and loop it).
+NO_STORE = {"Cache-Control": "no-store"}
 
 _SW_JS = """'use strict';
 // neko-sudo service worker: show approval pushes; tap opens the card.

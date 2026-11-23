@@ -25,8 +25,9 @@ UNCOLLECTED_CUTOFF_S = 30
 
 
 class EarlierPending(Exception):
-    """Approve refused: earlier requests from the same host are still
-    pending. Deny is never refused."""
+    """Decision refused: earlier requests from the same host are still
+    pending. Only the first request of a host's series can be decided,
+    approve or deny."""
 
     def __init__(self, earlier_ids):
         super().__init__(f"earlier same-host requests pending: {earlier_ids}")
@@ -371,10 +372,9 @@ class RequestStore:
                 raise ValueError(
                     f"request {request_id} is {request['status']}, not pending"
                 )
-            if status == "approved":
-                earlier = self._earlier_pending_locked(request, self._clock())
-                if earlier:
-                    raise EarlierPending([r["id"] for r in earlier])
+            earlier = self._earlier_pending_locked(request, self._clock())
+            if earlier:
+                raise EarlierPending([r["id"] for r in earlier])
             self._conn.execute(
                 "UPDATE requests SET status = ?, decided_at = ?"
                 " WHERE id = ? AND status = 'pending'",

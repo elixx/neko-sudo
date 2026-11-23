@@ -78,12 +78,16 @@ agent ALL=(root) NOPASSWD: /usr/local/lib/neko-sudo/run
   shows the host and an argv preview, and a tap opens the console page.
 - Requests are rate-limited per host (30 per minute).
 - **Same-host start order.** Requests from one host carry a per-host
-  sequence number. A later request cannot be approved while an earlier one
-  from the same host is still pending (deny is always allowed), and the
-  console says so: cards, the review screen and the push show the
-  request's place in its host's queue (`2 of 3 pending on web01`), and
-  `approve/options` answers `409 earlier_pending` before any passkey
-  ceremony starts. An approved request is handed to its wrapper only once
+  sequence number, and only the first pending request of a host's series
+  can be decided: approve and deny on a later one are refused, and
+  `approve/options`, `approve` and `deny` answer `409 earlier_pending`
+  before any passkey ceremony starts. The console shows each request's
+  place in its host's queue (`2 of 3 pending on web01` on cards, `(2 of 3)`
+  at the start of the review's title line and the push). The review moves
+  through a host's series with Prev/Next, a left/right swipe or the arrow
+  keys; on a later card Approve and Deny are disabled and the earlier
+  request is listed with "Go to first", and deciding the first card moves
+  the review on to the next one. An approved request is handed to its wrapper only once
   every earlier same-host request is denied, expired or already handed
   over; until then the host poll answers `pending` with `held_behind`,
   which the wrapper keeps polling on. An approval nobody collects stops
@@ -132,6 +136,11 @@ agent ALL=(root) NOPASSWD: /usr/local/lib/neko-sudo/run
   as text only, so a crafted value (for example a directory name) cannot
   restyle or overlay the card you are approving. The CSP allows only
   same-origin scripts.
+- An open console notices a gate redeploy: `/approvals` carries the gate's
+  build id, and the page reloads itself once (keeping an open review's
+  deep link) when it differs from the build it was served with, never
+  while a passkey prompt is open. Console pages and scripts are served
+  `Cache-Control: no-store`.
 
 ## Setup
 

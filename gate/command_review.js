@@ -85,6 +85,36 @@ function queueText(request) {
   return `${queue.position} of ${queue.total} pending on ${visibleText(request.host)}`;
 }
 
+function seriesOf(request, pending) {
+  // A host's pending requests form one series, first one first.
+  // Only the first can be decided; the rest can only be looked at.
+  return pending.filter(item => item.host === request.host)
+    .sort((a, b) => (a.queue?.position || 0) - (b.queue?.position || 0));
+}
+
+const SWIPE_MIN_PX = 60;
+function swipeStep(dx, dy) {
+  // Finger moving left shows the next card, right the previous one. Short
+  // or diagonal drags are scrolling, not navigation.
+  if (Math.abs(dx) < SWIPE_MIN_PX || Math.abs(dx) < 1.5 * Math.abs(dy)) return 0;
+  return dx < 0 ? 1 : -1;
+}
+
+function reloadDecision(serverBuild, pageBuild, busy, triedBuild) {
+  // After a gate redeploy an open tab still runs the old script (a
+  // push tap only changes the #fragment). Reload once per new build, never
+  // during a passkey ceremony; if the reload didn't take, just say so.
+  // triedBuild null = storage blocked: the attempt can't be remembered, so
+  // never auto-reload (it could loop).
+  if (!serverBuild || serverBuild === pageBuild) return 'none';
+  if (busy) return 'wait';
+  return triedBuild === null || triedBuild === serverBuild ? 'notice' : 'reload';
+}
+
+function triedBuild(storage) {
+  try { return storage.getItem('neko-sudo-build') || ''; } catch (_) { return null; }
+}
+
 function formatCommand(argv) {
   const exact = visibleText(JSON.stringify(argv, null, 2));
   const name = argv[0]?.split('/').pop();
@@ -119,32 +149,79 @@ function syncLinkedReview() {
 }
 
 function renderOrder(request, pending) {
-  // An earlier same-host request must be decided
-  // first. Approve stays disabled while this list is non-empty; Deny
-  // does not. Agent-controlled argv is text only.
+  // While an earlier same-host request is pending, this card can't be
+  // decided at all (approve or deny). Agent-controlled argv is text only.
   const earlier = pending ? (request.earlier || []) : [];
   $('review-order').hidden = !earlier.length;
   $('review-order-list').replaceChildren(...earlier.map(item => {
     const row = document.createElement('li');
     const code = document.createElement('code');
     code.textContent = commandSummary(item.argv);
-    const go = document.createElement('button');
-    go.type = 'button';
-    go.textContent = 'Review this first';
-    go.onclick = () => reviewEarlier(item.id);
-    row.append(code, ' ', go);
+    row.append(code);
     return row;
   }));
   const queue = pending ? queueText(request) : '';
   $('review-queue').textContent = queue;
   $('review-queue').hidden = $('review-queue-label').hidden = !queue;
+  renderSeries(request, pending);
 }
 
-function reviewEarlier(id) {
-  if (activeReview?.busy) return;
-  closeReview();
-  history.replaceState(null, '', `${location.pathname}${location.search}#review=${id}`);
-  syncLinkedReview();
+function renderSeries(request, pending) {
+  const series = pending ? seriesOf(request, pendingReviews) : [];
+  const index = series.findIndex(item => item.id === request.id);
+  const show = series.length > 1 && index >= 0;
+  $('review-series').hidden = !show;
+  // The position leads the title line on every card of
+  // a series, so it never ends up below the "decide first" notice.
+  $('review-position').hidden = !show;
+  $('review-position').textContent = show ? `(${index + 1} of ${series.length})` : '';
+  if (!show) return;
+  $('review-series-label').textContent =
+    `${index + 1} of ${series.length} on ${visibleText(request.host)}`;
+  $('review-prev').disabled = index === 0;
+  $('review-next').disabled = index === series.length - 1;
+}
+
+function switchReview(target, note = '') {
+  // Same dialog, another card of the series: the deep link follows along.
+  if (!target || activeReview?.busy) return;
+  $('command-review').close();
+  activeReview = null;
+  history.replaceState(null, '', `${location.pathname}${location.search}#review=${target.id}`);
+  openReview(target, true);
+  if (note) $('review-result').textContent = note;
+}
+
+function goSeries(step) {
+  const item = activeReview;
+  if (!item?.pending || item.busy) return;
+  const series = seriesOf(item.request, pendingReviews);
+  const index = series.findIndex(entry => entry.id === item.request.id);
+  if (index >= 0) switchReview(series[index + step]);
+}
+
+function goFirst() {
+  const item = activeReview;
+  if (!item?.pending || item.busy) return;
+  switchReview(seriesOf(item.request, pendingReviews)[0]);
+}
+
+async function advanceAfter(decided, verb) {
+  // Deciding the first card moves on to the next one of
+  // the series, which is now the first and decidable. Wait for a poll that
+  // no longer lists the decided request, so the next card's state is fresh.
+  for (let attempt = 0; attempt < 6; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 250));
+    if (activeReview?.request.id !== decided.id) return;  // owner moved on
+    await refresh();
+    // Again after the poll: the owner may have closed the review or moved
+    // to another card while it was in flight.
+    if (activeReview?.request.id !== decided.id || !$('command-review').open) return;
+    if (pendingReviews.some(item => item.id === decided.id)) continue;
+    const next = seriesOf(decided, pendingReviews)[0];
+    if (next) switchReview(next, `Previous request ${verb}. This is the next one from ${visibleText(decided.host)}.`);
+    return;
+  }
 }
 
 function closeReview() {
@@ -192,7 +269,7 @@ function openReview(request, pending) {
     }
   }
   $('review-actions').hidden = !pending;
-  renderOrder(request, pending);
+  renderOrder(request, pending);  // also draws the series bar
   updateReviewButtons();
   dialog.showModal();
   $('review-body').scrollTop = 0;
@@ -205,8 +282,8 @@ function updateReviewButtons() {
   const left = Math.max(0, Math.ceil((item.deadline - performance.now()) / 1000));
   $('review-timing').textContent = item.ended ? 'No longer pending' :
     left ? `${left}s remaining` : 'Approval window expired';
-  $('review-deny').disabled = item.busy || item.ended || !left;
-  $('review-approve').disabled = $('review-deny').disabled ||
+  // Only the first card of a series can be decided: both buttons.
+  $('review-approve').disabled = $('review-deny').disabled = item.busy || item.ended || !left ||
     (item.request.earlier || []).length > 0;
   $('review-close').disabled = item.busy;
 }
@@ -218,16 +295,18 @@ async function decideReview(approved) {
   $('review-result').textContent = approved ? 'Waiting for passkey…' : 'Denying…';
   updateReviewButtons();
   const id = encodeURIComponent(item.request.id);
+  let decided = false;
   try {
     if (approved) await approve(id);
     else await api(`/approvals/${id}/deny`, {method: 'POST'});
     item.ended = true;
+    decided = true;
     $('review-result').textContent = approved ? 'Approved.' : 'Denied.';
   } catch (error) {
     if (error.code === 'earlier_pending') {
       item.request.earlier = error.body?.detail?.earlier || item.request.earlier;
       renderOrder(item.request, true);
-      $('review-result').textContent = 'Approval refused: decide the earlier request from this host first.';
+      $('review-result').textContent = 'Refused: decide the first request from this host first.';
     } else {
       $('review-result').textContent = `${approved ? 'Approval' : 'Denial'} failed: ${error.code || error.message}`;
     }
@@ -235,8 +314,9 @@ async function decideReview(approved) {
   } finally {
     item.busy = false;
     updateReviewButtons();
-    refresh();
+    if (!decided) refresh();
   }
+  if (decided) advanceAfter(item.request, approved ? 'approved' : 'denied');
 }
 
 function initReview() {
@@ -244,6 +324,27 @@ function initReview() {
   $('review-close').onclick = closeReview;
   $('review-approve').onclick = () => decideReview(true);
   $('review-deny').onclick = () => decideReview(false);
+  $('review-prev').onclick = () => goSeries(-1);
+  $('review-next').onclick = () => goSeries(1);
+  $('review-first').onclick = goFirst;
+  dialog.addEventListener('keydown', event => {
+    if (event.key === 'ArrowLeft') goSeries(-1);
+    else if (event.key === 'ArrowRight') goSeries(1);
+  });
+  // Swipe between the cards of a series; vertical drags keep scrolling.
+  const body = $('review-body');
+  let touch = null;
+  body.addEventListener('touchstart', event => {
+    touch = event.touches.length === 1 ? {x: event.touches[0].clientX, y: event.touches[0].clientY} : null;
+  }, {passive: true});
+  body.addEventListener('touchend', event => {
+    const end = event.changedTouches[0];
+    if (touch && end) {
+      const step = swipeStep(end.clientX - touch.x, end.clientY - touch.y);
+      if (step) goSeries(step);
+    }
+    touch = null;
+  }, {passive: true});
   dialog.oncancel = event => {
     event.preventDefault();
     closeReview();

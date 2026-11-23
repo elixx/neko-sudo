@@ -64,10 +64,17 @@ def test_approving_later_request_is_refused_while_earlier_is_pending(tmp_path):
     assert store.get_request(b["id"])["status"] == "pending"
 
 
-def test_denying_later_request_is_allowed_while_earlier_is_pending(tmp_path):
+def test_denying_later_request_is_refused_while_earlier_is_pending(tmp_path):
+    """Only the first request of a host's series can be decided at all,
+    deny included."""
     store, _ = make(tmp_path)
-    create(store)
+    a = create(store)
     b = create(store)
+    with pytest.raises(EarlierPending) as exc:
+        store.decide(b["id"], "deny")
+    assert exc.value.earlier_ids == [a["id"]]
+    assert store.get_request(b["id"])["status"] == "pending"
+    store.decide(a["id"], "deny")
     assert store.decide(b["id"], "deny")["status"] == "denied"
 
 

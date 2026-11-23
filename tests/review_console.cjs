@@ -65,3 +65,43 @@ test('queue badge names position and host only when requests are stacked', () =>
   assert.equal(context.queueText({host: 'web01'}), '');
   assert.equal(context.queueText({host: 'a\u202eb', queue: {position: 1, total: 2}}), '1 of 2 pending on a\\u202eb');
 });
+
+test('served console script runs in strict mode', () => {
+  const fresh = vm.createContext({atob, btoa, TextDecoder, Uint8Array,
+    document: {getElementById: () => ({})}, addEventListener() {},
+    fetch: () => new Promise(() => {}),
+  });
+  assert.throws(() => vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\n__strictProbe = 1;', fresh),
+    /__strictProbe is not defined/);
+});
+
+test('series: same host only, first request first', () => {
+  const pending = [
+    {id: 'b', host: 'web01', queue: {position: 2, total: 2}},
+    {id: 'x', host: 'web02', queue: {position: 1, total: 1}},
+    {id: 'a', host: 'web01', queue: {position: 1, total: 2}},
+  ];
+  assert.deepEqual(Array.from(context.seriesOf({id: 'b', host: 'web01'}, pending), r => r.id), ['a', 'b']);
+  assert.deepEqual(Array.from(context.seriesOf({id: 'x', host: 'web02'}, pending), r => r.id), ['x']);
+});
+
+test('swipe: mostly-horizontal drags past the threshold step the series', () => {
+  assert.equal(context.swipeStep(-120, 10), 1);   // finger moves left: next card
+  assert.equal(context.swipeStep(120, -10), -1);  // finger moves right: previous card
+  assert.equal(context.swipeStep(-40, 0), 0);     // too short
+  assert.equal(context.swipeStep(-120, 100), 0);  // too diagonal: that's a scroll
+  assert.equal(context.swipeStep(0, 300), 0);     // vertical scroll
+});
+
+test('reload after a gate redeploy: once per build, never mid-ceremony', () => {
+  assert.equal(context.reloadDecision('new', 'old', false, ''), 'reload');
+  assert.equal(context.reloadDecision('old', 'old', false, ''), 'none');
+  assert.equal(context.reloadDecision(undefined, 'old', false, ''), 'none');
+  assert.equal(context.reloadDecision('new', 'old', true, ''), 'wait');
+  assert.equal(context.reloadDecision('new', 'old', false, 'new'), 'notice');
+  // Storage blocked: no way to remember the attempt, so never auto-reload.
+  assert.equal(context.reloadDecision('new', 'old', false, null), 'notice');
+  assert.equal(context.triedBuild({getItem() { throw new Error('blocked'); }}), null);
+  assert.equal(context.triedBuild({getItem: () => 'abc'}), 'abc');
+  assert.equal(context.triedBuild({getItem: () => null}), '');
+});
