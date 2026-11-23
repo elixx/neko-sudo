@@ -77,6 +77,14 @@ function commandSummary(argv) {
   return preview;
 }
 
+function queueText(request) {
+  // Where a request sits among its host's pending requests. Shown
+  // only when requests are stacked; the host is agent-controlled text.
+  const queue = request.queue;
+  if (!queue || !(queue.total > 1)) return '';
+  return `${queue.position} of ${queue.total} pending on ${visibleText(request.host)}`;
+}
+
 function formatCommand(argv) {
   const exact = visibleText(JSON.stringify(argv, null, 2));
   const name = argv[0]?.split('/').pop();
@@ -108,6 +116,44 @@ function syncLinkedReview() {
   const notice = match ? '' : 'This request is no longer pending. Check Recent requests.';
   if ($('review-link-status').textContent !== notice) $('review-link-status').textContent = notice;
   if (match) openReview(match, true);
+}
+
+function renderOrder(request, pending) {
+  // An earlier same-host request must be decided
+  // first. Approve stays disabled while this list is non-empty; Deny
+  // does not. Agent-controlled argv is text only.
+  const earlier = pending ? (request.earlier || []) : [];
+  $('review-order').hidden = !earlier.length;
+  $('review-order-list').replaceChildren(...earlier.map(item => {
+    const row = document.createElement('li');
+    const code = document.createElement('code');
+    code.textContent = commandSummary(item.argv);
+    const go = document.createElement('button');
+    go.type = 'button';
+    go.textContent = 'Review this first';
+    go.onclick = () => reviewEarlier(item.id);
+    row.append(code, ' ', go);
+    return row;
+  }));
+  const queue = pending ? queueText(request) : '';
+  $('review-queue').textContent = queue;
+  $('review-queue').hidden = $('review-queue-label').hidden = !queue;
+}
+
+function reviewEarlier(id) {
+  if (activeReview?.busy) return;
+  closeReview();
+  history.replaceState(null, '', `${location.pathname}${location.search}#review=${id}`);
+  syncLinkedReview();
+}
+
+function closeReview() {
+  if (activeReview?.busy) return;
+  const id = activeReview?.request.id;
+  $('command-review').close();
+  activeReview = null;
+  if (id && linkedReviewId() === id) history.replaceState(null, '', location.pathname + location.search);
+  syncLinkedReview();
 }
 
 function openReview(request, pending) {
@@ -146,6 +192,7 @@ function openReview(request, pending) {
     }
   }
   $('review-actions').hidden = !pending;
+  renderOrder(request, pending);
   updateReviewButtons();
   dialog.showModal();
   $('review-body').scrollTop = 0;
@@ -158,7 +205,9 @@ function updateReviewButtons() {
   const left = Math.max(0, Math.ceil((item.deadline - performance.now()) / 1000));
   $('review-timing').textContent = item.ended ? 'No longer pending' :
     left ? `${left}s remaining` : 'Approval window expired';
-  $('review-approve').disabled = $('review-deny').disabled = item.busy || item.ended || !left;
+  $('review-deny').disabled = item.busy || item.ended || !left;
+  $('review-approve').disabled = $('review-deny').disabled ||
+    (item.request.earlier || []).length > 0;
   $('review-close').disabled = item.busy;
 }
 
@@ -175,7 +224,13 @@ async function decideReview(approved) {
     item.ended = true;
     $('review-result').textContent = approved ? 'Approved.' : 'Denied.';
   } catch (error) {
-    $('review-result').textContent = `${approved ? 'Approval' : 'Denial'} failed: ${error.code || error.message}`;
+    if (error.code === 'earlier_pending') {
+      item.request.earlier = error.body?.detail?.earlier || item.request.earlier;
+      renderOrder(item.request, true);
+      $('review-result').textContent = 'Approval refused: decide the earlier request from this host first.';
+    } else {
+      $('review-result').textContent = `${approved ? 'Approval' : 'Denial'} failed: ${error.code || error.message}`;
+    }
     if (error.code === 'not_pending' || error.code === 'unknown_request') item.ended = true;
   } finally {
     item.busy = false;
@@ -186,14 +241,6 @@ async function decideReview(approved) {
 
 function initReview() {
   const dialog = $('command-review');
-  const closeReview = () => {
-    if (activeReview?.busy) return;
-    const id = activeReview?.request.id;
-    dialog.close();
-    activeReview = null;
-    if (id && linkedReviewId() === id) history.replaceState(null, '', location.pathname + location.search);
-    syncLinkedReview();
-  };
   $('review-close').onclick = closeReview;
   $('review-approve').onclick = () => decideReview(true);
   $('review-deny').onclick = () => decideReview(false);

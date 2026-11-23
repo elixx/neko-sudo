@@ -32,6 +32,8 @@ owner taps the push -> the gate console (/) lists pending cards
   -> deny:    signed-in owner session
 
 wrapper polls until approved / denied / expired
+  -> same host: an approval is handed over only after every earlier
+     request from that host is settled; until then the poll says pending
   -> approved: exec exactly the approved argv as root, clean environment
   -> anything else: exit 1
 ```
@@ -75,6 +77,21 @@ agent ALL=(root) NOPASSWD: /usr/local/lib/neko-sudo/run
 - The push carries **no authority**. It is end-to-end encrypted (RFC 8291),
   shows the host and an argv preview, and a tap opens the console page.
 - Requests are rate-limited per host (30 per minute).
+- **Same-host start order.** Requests from one host carry a per-host
+  sequence number. A later request cannot be approved while an earlier one
+  from the same host is still pending (deny is always allowed), and the
+  console says so: cards, the review screen and the push show the
+  request's place in its host's queue (`2 of 3 pending on web01`), and
+  `approve/options` answers `409 earlier_pending` before any passkey
+  ceremony starts. An approved request is handed to its wrapper only once
+  every earlier same-host request is denied, expired or already handed
+  over; until then the host poll answers `pending` with `held_behind`,
+  which the wrapper keeps polling on. An approval nobody collects stops
+  holding later requests back, and can no longer be handed over, 30 s
+  after its expiry; that pass-over is recorded (`uncollected_at`) in the
+  same commit as the hand-over that relied on it, so a clock stepping back
+  cannot revive it. The guarantee is start order: the gate never sees a
+  command finish.
 
 **Hosts**
 

@@ -24,6 +24,9 @@ Fail-closed rules baked in:
 * Approval completion requires a fresh user-verified passkey assertion —
   a signed-in cookie alone can only deny.
 * Cross-site POSTs (Origin / Sec-Fetch-Site) are rejected outright.
+* Same-host order: approve is refused with 409 ``earlier_pending``
+  while an earlier request from the same host is still pending, before
+  any passkey ceremony starts. Deny is always allowed.
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ from gate.sessions import (
     cookie_value,
     set_cookie_header,
 )
+from gate.store import EarlierPending
 from gate.webauthn import (
     COSE_ALG_ES256,
     COSE_ALG_RS256,
@@ -174,12 +178,28 @@ def build_console_router(
         return rec["challenge"]
 
     def card(request: dict) -> dict:
+        queue = request_store.host_queue(request["id"]) or {
+            "position": 1, "total": 1, "earlier": []}
         return {
             **{k: request[k] for k in
                ("id", "host", "user", "argv", "cwd", "digest", "status",
                 "created_at", "expires_at")},
             "seconds_left": max(0, int(request["expires_at"] - clock())),
+            # Where this request sits in its host's queue, and what
+            # must be decided before it can be approved.
+            "queue": {"position": queue["position"], "total": queue["total"]},
+            "earlier": brief(queue["earlier"]),
         }
+
+    def brief(requests: list) -> list:
+        return [{"id": r["id"], "argv": r["argv"]} for r in requests]
+
+    def require_in_order(request_id: str) -> None:
+        """Same-host order: no approve, and no passkey ceremony
+        spent on one, while an earlier same-host request is pending."""
+        earlier = request_store.earlier_pending(request_id)
+        if earlier:
+            err(409, "earlier_pending", earlier=brief(earlier))
 
     def pending_or_4xx(request_id: str, *, decided_status: int) -> dict:
         request = request_store.get_request(request_id)
@@ -194,6 +214,9 @@ def build_console_router(
             return request_store.decide(request_id, decision)
         except LookupError:
             err(404, "unknown_request")
+        except EarlierPending as exc:
+            earlier = [request_store.get_request(i) for i in exc.earlier_ids]
+            err(409, "earlier_pending", earlier=brief([r for r in earlier if r]))
         except ValueError as exc:
             err(409, "not_pending", reason=str(exc))
 
@@ -376,6 +399,7 @@ def build_console_router(
         require_same_origin(request)
         raw, _ = session_of(request)
         pending_or_4xx(request_id, decided_status=410)
+        require_in_order(request_id)
         session_digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         challenge_id, rec = new_challenge(
             purpose={"type": "decide", "request_id": request_id,
@@ -401,6 +425,8 @@ def build_console_router(
         require_same_origin(request)
         raw, _ = session_of(request)
         pending_or_4xx(request_id, decided_status=409)
+        # Before pop_challenge: a refused approve leaves the ceremony usable.
+        require_in_order(request_id)
         session_digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         challenge = pop_challenge(
             body.challenge_id,
@@ -651,7 +677,12 @@ _INDEX_HTML = """<!doctype html>
  #review-actions{display:flex;gap:.65rem;flex-wrap:wrap} #review-actions button{margin:0;min-height:44px}
  #review-approve:not(:disabled){background:#15452f;border-color:#52c082}
  #review-deny:not(:disabled){background:#4e2128;border-color:#e47580}
+ #command-review button:disabled{opacity:.45;cursor:not-allowed}
  #review-result:empty{display:none} #review-result{margin:.5rem 0 0;overflow-wrap:anywhere}
+ #review-order{border:1px solid #d99530;border-radius:.5rem;background:#33260f;padding:.6rem .8rem;margin:0 0 1rem}
+ #review-order p{margin:0 0 .4rem} #review-order ul{margin:0;padding-left:1.1rem}
+ #review-order li{overflow-wrap:anywhere;margin:.25rem 0} #review-order button{margin:.25rem 0 0;min-height:44px}
+ .queue{color:#f0c27a}
  :focus-visible{outline:2px solid #a7ccff;outline-offset:3px}
 </style>
 </head>
@@ -693,8 +724,13 @@ _INDEX_HTML = """<!doctype html>
   <button type="button" id="review-close" autofocus>Close</button>
  </header>
  <div id="review-body">
+  <section id="review-order" role="status" hidden>
+   <p><b>Decide the earlier request from this host first.</b> Approve unlocks once it is approved, denied or expires. Deny works now.</p>
+   <ul id="review-order-list"></ul>
+  </section>
   <dl id="review-meta">
    <dt>Host</dt><dd id="review-host"></dd>
+   <dt id="review-queue-label" hidden>Queue</dt><dd id="review-queue" hidden></dd>
    <dt>Requested by</dt><dd id="review-user"></dd>
    <dt>Working directory</dt><dd id="review-cwd"></dd>
    <dt id="review-digest-label">Digest</dt><dd id="review-digest" dir="ltr"></dd>
@@ -763,6 +799,15 @@ async function refresh(){
       activeReview.ended=true;
       updateReviewButtons();
     }
+    // An earlier same-host request decided elsewhere unlocks Approve
+    // on an open review without reopening it.
+    const live=activeReview?.pending && pending.find(r=>r.id===activeReview.request.id);
+    if(live && JSON.stringify(live.earlier)!==JSON.stringify(activeReview.request.earlier)){
+      activeReview.request.earlier=live.earlier;
+      activeReview.request.queue=live.queue;
+      renderOrder(activeReview.request,true);
+      updateReviewButtons();
+    }
     syncLinkedReview();
     loadHistory(histPage);
   }catch(e){
@@ -821,7 +866,10 @@ function card(r){
   const d=el('div',null,'card');
   const head=el('div');
   head.append(el('b',visibleText(r.host)),' · user ',el('code',visibleText(r.user)));
+  const queue=queueText(r);
+  if(queue)head.append(' · ',el('span',queue,'queue'));
   const cmd=el('p');cmd.append(el('code',commandSummary(r.argv)));
+  if(r.earlier&&r.earlier.length)cmd.append(el('div','Decide the earlier request first','queue'));
   const review=el('button','Review command');
   review.type='button';
   review.onclick=()=>{

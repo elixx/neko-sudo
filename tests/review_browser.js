@@ -6,7 +6,14 @@ const openCard = {id: 'pending-1', host: 'fixture-host', user: 'neko', cwd: '<st
   argv: ['/bin/sh', '-c', fixtureScript, 'arg0', ''], seconds_left: 90, digest: 'a'.repeat(64)};
 const oldCard = {...openCard, id: 'finished-1', argv: ['sh', '-c', 'id; uptime'], cwd: '/tmp',
   digest: undefined, status: 'approved', decided_at: 1794000000, created_at: 1793000000};
-let pending = [openCard];
+// The deep-linked card starts blocked behind an earlier same-host
+// request; the fixture decides that one elsewhere mid-test.
+const earlierCard = {id: 'earlier-1', host: 'fixture-host', user: 'neko', cwd: '/tmp',
+  argv: ['systemctl', 'stop', 'x'], seconds_left: 90, digest: 'b'.repeat(64),
+  queue: {position: 1, total: 2}, earlier: []};
+const blockedCard = {...openCard, queue: {position: 2, total: 2},
+  earlier: [{id: 'earlier-1', argv: earlierCard.argv}]};
+let pending = [earlierCard, blockedCard];
 const writes = [];
 const tick = (ms = 25) => new Promise(resolve => setTimeout(resolve, ms));
 const check = (value, label) => { if (!value) throw new Error(label); };
@@ -34,6 +41,24 @@ window.addEventListener('load', async () => {
   const d = get('command-review');
   try {
     await until(() => d.open, 'deep link did not open the exact pending card');
+    check(!get('review-order').hidden, 'blocked card did not explain the earlier request');
+    check(get('review-order-list').textContent.includes('systemctl stop x'), 'earlier argv missing');
+    check(get('review-queue').textContent === '2 of 2 pending on fixture-host', 'queue position missing');
+    check(get('review-approve').disabled && !get('review-deny').disabled, 'approve must be blocked, deny allowed');
+    check(Number(getComputedStyle(get('review-approve')).opacity) < 0.6, 'blocked approve does not look disabled');
+    check(document.querySelector('#approvals .queue'), 'pending card shows no queue badge');
+    get('review-order-list').querySelector('button').click();
+    await until(() => d.open && location.hash === '#review=earlier-1', 'earlier request did not open');
+    check(get('review-exact').textContent.includes('"stop"'), 'switched to the wrong request');
+    check(!get('review-approve').disabled && get('review-order').hidden, 'earlier request must be approvable');
+    check(writes.length === 0, 'switching requests wrote a decision');
+    get('review-close').click();
+    await until(() => !d.open, 'earlier review would not close');
+    pending = [openCard];  // the earlier request was decided elsewhere
+    history.replaceState(null, '', '#review=pending-1');
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    await until(() => d.open && !get('review-approve').disabled, 'approve did not unlock once the earlier request was decided');
+    check(get('review-order').hidden && get('review-queue').hidden, 'stale order notice after the earlier request was decided');
     const box = d.getBoundingClientRect();
     check(box.width === innerWidth && box.height === innerHeight, 'dialog did not fill viewport');
     check(document.activeElement === get('review-close'), 'initial focus must be on the safe close button');

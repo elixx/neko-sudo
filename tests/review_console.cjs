@@ -58,3 +58,10 @@ test('oversize or excessively fragmented commands fall back without losing text'
     assert.equal(view.shell.formatted, false);
   }
 });
+
+test('queue badge names position and host only when requests are stacked', () => {
+  assert.equal(context.queueText({host: 'web01', queue: {position: 2, total: 3}}), '2 of 3 pending on web01');
+  assert.equal(context.queueText({host: 'web01', queue: {position: 1, total: 1}}), '');
+  assert.equal(context.queueText({host: 'web01'}), '');
+  assert.equal(context.queueText({host: 'a\u202eb', queue: {position: 1, total: 2}}), '1 of 2 pending on a\\u202eb');
+});

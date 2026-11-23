@@ -102,16 +102,24 @@ def create_app(
             cwd=body.cwd,
             ttl_s=default_ttl_s,  # gate owns the window; body.ttl_s is ignored
         )
+        # The push says where this request sits in its host's queue
+        # ("(2 of 3) host · argv"). Only the push copy is enriched: the
+        # wrapper's create response stays exactly the stored row.
+        queue = store.host_queue(request["id"]) or {}
+        notice = {**request, "queue": {"position": queue.get("position", 1),
+                                       "total": queue.get("total", 1)}}
         # The wake-up goes out AFTER the 201 is on the wire: a slow
         # push service must never delay the wrapper or its expiry notice.
-        background_tasks.add_task(push.request_created, request)
+        background_tasks.add_task(push.request_created, notice)
         return request
 
     @app.get("/v1/requests/{request_id}")
     def poll_request(request_id: str, authorization: str | None = Header(default=None)):
         host = host_for(authorization)
-        request = store.get_request(request_id)
-        if request is None or request["host"] != host:
+        # Same-host start order: the store withholds an approval
+        # ("pending" + held_behind) until earlier requests are settled.
+        request = store.poll_for_host(request_id, host)
+        if request is None:
             raise HTTPException(status_code=404, detail="not found")
         return request
 

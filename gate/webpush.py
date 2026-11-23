@@ -110,9 +110,15 @@ class WebPushPush:
         review_url = "/"
         if isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", request_id):
             review_url = f"/#review={request_id}"
+        body = f"{request.get('host', '?')} \u00b7 {argv}"
+        # A stacked request says so on the lock screen, so a push that
+        # arrives out of order is visibly not the first one to decide.
+        queue = request.get("queue") or {}
+        if isinstance(queue.get("total"), int) and queue["total"] > 1:
+            body = f"({queue.get('position', '?')} of {queue['total']}) {body}"
         payload = {
             "title": "neko-sudo: approval needed",
-            "body": f"{request.get('host', '?')} \u00b7 {argv}",
+            "body": body,
             # Select this request on the sign-in-aware page, never a JSON route.
             "url": review_url,
         }
